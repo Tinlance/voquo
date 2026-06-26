@@ -1,36 +1,36 @@
 """
-render_ffmpeg.py — v4 (Windows ASS Path Fix)
----------------------------------------------
-Fixes: "Unable to parse original_size option value as image size"
-Root cause: subtitles= filter on Windows needs escaped backslashes
-and must NOT include original_size or size parameters.
-Solution: Pass ASS path using ass= filter instead of subtitles=
-which avoids the original_size parsing bug entirely on Windows FFmpeg 8.x
+render_ffmpeg.py — v6 (Image + Video Background Support)
+----------------------------------------------------------
+Supports per-scene backgrounds:
+  - scene_01.jpg / scene_01.png → static image background
+  - scene_01.mp4 / scene_01.mov → video background
+  - Falls back to broll_*.mp4 cycling if no scene file found
+  - Falls back to black if no backgrounds at all
 """
 
 import json
 import os
+import re as _re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 
-SYNC_DIR   = Path("output/sync")
-SCENE_DIR  = Path("output/scenes")
-ASS_DIR    = Path("output/ass")
-FINAL_DIR  = Path("output")
-MUSIC_DIR  = Path("music")
+SYNC_DIR     = Path("output/sync")
+SCENE_DIR    = Path("output/scenes")
+ASS_DIR      = Path("output/ass")
+FINAL_DIR    = Path("output")
+MUSIC_DIR    = Path("music")
 
-WIDTH  = 1080
-HEIGHT = 1920
-FPS    = 30
+WIDTH        = 1080
+HEIGHT       = 1920
+FPS          = 30
 MUSIC_VOLUME = "0.15"
 
-# Tinlance brand colors (ASS BGR format)
-COLOR_WHITE = "&H00FFFFFF"
-COLOR_TEAL  = "&H00C8E500"
-COLOR_BG    = "&H99000000"
+COLOR_WHITE  = "&H00FFFFFF"
+COLOR_TEAL   = "&H00C8E500"
+COLOR_BG     = "&H99000000"
 
 EMPHASIS_WORDS = {
     "hunting","survival","predator","paranoia","apophenia",
@@ -38,12 +38,12 @@ EMPHASIS_WORDS = {
     "ancestors","neurons","ancient","threat","randomness",
     "hyper-vigilant","invents","misfiring","irresistible",
     "descendants","terror","fear","mind","consciousness",
-    "survival","machines","ancient","paranoia"
+    "darkness","dark","shadow","blood","silence","void"
 }
 
-import re
+
 def word_is_emphasis(word):
-    clean = re.sub(r"[^a-zA-Z\-]", "", word).lower()
+    clean = _re.sub(r"[^a-zA-Z\-]", "", word).lower()
     return clean in EMPHASIS_WORDS
 
 
@@ -74,14 +74,12 @@ Style: Teal,Arial,72,{COLOR_TEAL},&H000000FF,&H00000000,{COLOR_BG},-1,0,0,0,100,
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     lines = [header]
-
     for card in flash_cards:
         start = card["start"]
         end   = min(card["end"] + 0.05, audio_duration)
         text  = card["text"].strip()
-        text  = text.replace("{","").replace("}","").replace("\n"," ")
+        text  = text.replace("{", "").replace("}", "").replace("\n", " ")
         text  = text.replace("'", "\\'")
-
         style = "Teal" if any(word_is_emphasis(w) for w in text.split()) else "White"
         lines.append(
             f"Dialogue: 0,{seconds_to_ass(start)},{seconds_to_ass(end)},"
@@ -106,14 +104,39 @@ def detect_gpu():
     return "cpu"
 
 
+def get_scene_background(scene_id):
+    """
+    Check backgrounds/ for a scene-specific file.
+    Returns (path, is_image) tuple.
+    Checks for exact scene match first, then falls back to cycling broll clips.
+    """
+    # Check for exact scene match — image or video
+    for ext in [".mp4", ".mov", ".jpg", ".jpeg", ".png"]:
+        path = Path(f"backgrounds/scene_{scene_id:02d}{ext}")
+        if path.exists():
+            is_image = ext in [".jpg", ".jpeg", ".png"]
+            return str(path), is_image
+
+    # Fall back to cycling broll clips
+    clips = sorted(Path("backgrounds").glob("broll_*.mp4"))
+    if clips:
+        return str(clips[scene_id % len(clips)]), False
+
+    # No background found
+    return None, False
+
+
 def get_music():
-    files = (list(MUSIC_DIR.glob("*.mp3")) +
-             list(MUSIC_DIR.glob("*.wav")) +
-             list(MUSIC_DIR.glob("*.m4a")))
+    files = (
+        list(MUSIC_DIR.glob("*.mp3")) +
+        list(MUSIC_DIR.glob("*.wav")) +
+        list(MUSIC_DIR.glob("*.m4a"))
+    )
     return str(files[0]) if files else None
 
 
-def render_scene(scene, music_path, ass_path, gpu_mode, out_path):
+def render_scene(scene, music_path, ass_path, gpu_mode, out_path,
+                 bg_path=None, is_image=False):
     if out_path.exists():
         print(f"  ⏭️  Scene {scene['id']:02d} already rendered — skipping")
         return True
@@ -130,14 +153,11 @@ def render_scene(scene, music_path, ass_path, gpu_mode, out_path):
         return False
 
     has_music = music_path and Path(music_path).exists()
+    has_bg    = bg_path and Path(bg_path).exists()
 
-    # ── Windows-safe ASS path: forward slashes, escape colons ──────────
-    # Use 'ass=' filter (not 'subtitles=') to avoid original_size bug
-    ass_win = str(ass_path.resolve()).replace("\\", "/")
-    # Escape the colon after drive letter: C:/path → C\:/path
-    ass_win = ass_win.replace(":/", "\\:/", 1)
+    # Windows-safe ASS path
+    ass_win = str(ass_path.resolve()).replace("\\", "/").replace(":/", "\\:/", 1)
 
-    # Video filter chain
     vf = (
         f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
         f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,"
@@ -145,27 +165,34 @@ def render_scene(scene, music_path, ass_path, gpu_mode, out_path):
         f"ass='{ass_win}'"
     )
 
-    encoder = "h264_nvenc" if gpu_mode == "nvenc" else "libx264"
-
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
 
-    # Black background source — pure lavfi, no background video needed
-    cmd += [
-        "-f", "lavfi",
-        "-i", f"color=c=0x080808:size={WIDTH}x{HEIGHT}:rate={FPS}"
-    ]
+    # ── Video/Image source ───────────────────────────────────────────
+    if has_bg and is_image:
+        # Static image — loop for duration of scene
+        cmd += ["-loop", "1", "-i", bg_path]
+    elif has_bg:
+        # Video clip — stream loop
+        cmd += ["-stream_loop", "-1", "-i", bg_path]
+    else:
+        # Pure black background
+        cmd += [
+            "-f", "lavfi",
+            "-i", f"color=c=0x080808:size={WIDTH}x{HEIGHT}:rate={FPS}"
+        ]
 
-    # Voice audio
+    # ── Audio ────────────────────────────────────────────────────────
     cmd += ["-i", audio_path]
 
-    # Music (optional)
     if has_music:
         cmd += ["-stream_loop", "-1", "-i", music_path]
         cmd += [
             "-filter_complex",
-            f"[1:a]volume=1.0[v];"
-            f"[2:a]volume={MUSIC_VOLUME}[m];"
-            f"[v][m]amix=inputs=2:duration=first[aout]",
+            (
+                f"[1:a]volume=1.0[v];"
+                f"[2:a]volume={MUSIC_VOLUME}[m];"
+                f"[v][m]amix=inputs=2:duration=first[aout]"
+            ),
             "-map", "0:v",
             "-map", "[aout]",
             "-vf", vf
@@ -177,12 +204,8 @@ def render_scene(scene, music_path, ass_path, gpu_mode, out_path):
             "-map", "1:a"
         ]
 
-    if encoder == "h264_nvenc":
-        cmd += ["-c:v", "h264_nvenc", "-preset", "p4", "-b:v", "4M"]
-    else:
-        cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "22"]
-
     cmd += [
+        "-c:v", "libx264", "-preset", "fast", "-crf", "22",
         "-c:a", "aac", "-b:a", "192k",
         "-t", str(duration),
         "-movflags", "+faststart",
@@ -190,8 +213,10 @@ def render_scene(scene, music_path, ass_path, gpu_mode, out_path):
         str(out_path)
     ]
 
-    encoder_label = "h264_nvenc" if encoder == "h264_nvenc" else "libx264"
-    print(f"  🎬 Rendering scene {scene['id']:02d} [{encoder_label}] ...")
+    bg_label = Path(bg_path).name if has_bg else "black"
+    bg_type  = "image" if is_image else "video"
+    print(f"  🎬 Rendering scene {scene['id']:02d} [{bg_label}] [{bg_type}] ...")
+
     result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode != 0:
@@ -269,7 +294,6 @@ def run(cleanup=False):
     SCENE_DIR.mkdir(parents=True, exist_ok=True)
     ASS_DIR.mkdir(parents=True, exist_ok=True)
 
-    gpu_mode   = detect_gpu()
     music_path = get_music()
 
     if music_path:
@@ -295,13 +319,19 @@ def run(cleanup=False):
         out_path = SCENE_DIR / f"scene_{sid:02d}.mp4"
         ass_path = ASS_DIR   / f"scene_{sid:02d}.ass"
 
+        # Get background — image or video
+        bg_path, is_image = get_scene_background(sid)
+
         ok = build_ass_file(scene["flash_cards"], scene["total_duration"], ass_path)
         if not ok:
             print(f"  ⚠️  Scene {sid:02d} — no flash cards, skipping")
             failed.append(sid)
             continue
 
-        ok = render_scene(scene, music_path, ass_path, gpu_mode, out_path)
+        ok = render_scene(
+            scene, music_path, ass_path, "cpu",
+            out_path, bg_path, is_image
+        )
         if ok:
             rendered.append(out_path)
         else:
@@ -312,7 +342,7 @@ def run(cleanup=False):
         print(f"⚠️  Failed scenes: {failed}")
 
     if not rendered:
-        print("❌ Nothing rendered. Check errors above.")
+        print("❌ Nothing rendered.")
         sys.exit(1)
 
     final_path  = FINAL_DIR / "final.mp4"
@@ -324,15 +354,14 @@ def run(cleanup=False):
     if success:
         print(f"\n🎉 PIPELINE COMPLETE!")
         print(f"📁 Full video:  {final_path.resolve()}")
-        print(f"📱 TikTok cut: {tiktok_path.resolve()}")
+        print(f"📱 TikTok cut:  {tiktok_path.resolve()}")
 
     if cleanup:
-        print("\n🧹 Cleanup: purging temp files...")
         for wav in Path("output/audio").glob("*.wav"):
             wav.unlink()
         for mp4 in SCENE_DIR.glob("*.mp4"):
             mp4.unlink()
-        print("✅ Done")
+        print("🧹 Temp files cleaned")
 
     return rendered
 

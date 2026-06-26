@@ -15,7 +15,7 @@ from pathlib import Path
 
 OUTPUT_DIR = Path("output/audio")
 SCRIPT_PATH = Path("script.json")
-VOICE = "af_heart"  # Dark, calm, philosophical female voice
+VOICE = "am_adam"  # Dark, calm, philosophical female voice
 SPEED = 0.92        # Slightly slower for dramatic pacing
 
 
@@ -64,8 +64,12 @@ def synthesize_scene(kokoro_instance, scene: dict, out_dir: Path) -> Path:
         lang="en-us"
     )
 
+    import numpy as np
     import soundfile as sf
-    sf.write(str(out_path), samples, sample_rate)
+
+    silence = np.zeros(int(sample_rate * 0.6), dtype=np.float32)
+    samples_with_pause = np.concatenate([samples, silence])
+    sf.write(str(out_path), samples_with_pause, sample_rate)
     print(f"  ✅  Saved → {out_path.name}")
     return out_path
 
